@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WebGL Fluid Experiment</title>
+    <link rel="stylesheet" href="iconfont.css">
+    <style>
+        html, body, #content { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+        #content { -webkit-user-select: none; user-select: none; }
+        html:not(.fluid-interactive) .dg.ac { display: none !important; }
+        .dg .cr.object { border-left: 3px solid #5cb36d; }
+        .dg .cr.disabled { border-left-color: #353535 !important; }
+        .dg .cr input[disabled] { background: none !important; color: #8c8c8c !important; }
+        .dg .cr.link, .dg .cr.link * { cursor: pointer; }
+        .dg .cr.footer { color: #939699; }
+        .dg .cr.footer:hover { color: #2fa1d6; }
+        .dg .cr [class^="icon-"] { float: right; width: 27px; text-align: center; font-size: 150%; }
+    </style>
+    <script>window.ga = function() {};</script>
+    <script src="GLFluid.js"></script>
+    <script src="dat.gui.min.js"></script>
+    <script src="viscosity.js"></script>
+    <script>
+        window.fluidWallpaperInteraction = function(enabled) {
+            document.documentElement.classList.toggle('fluid-interactive', enabled);
+        };
+        const OriginalGUI = dat.GUI;
+        dat.GUI = function(options) {
+            const gui = new OriginalGUI(options);
+            window.fluidWallpaperGUI = gui;
+            const originalAdd = gui.add;
+            function reportSettings(simulation) {
+                window.webkit?.messageHandlers.fluidSettings?.postMessage({
+                    quality: String(simulation.simulationQuality),
+                    viscosity: simulation.wallpaperViscosity,
+                    iterations: simulation.fluid.solverIterations,
+                    particles: simulation.particles.count,
+                    fluidWidth: simulation.fluid.width, fluidHeight: simulation.fluid.height,
+                    outputWidth: simulation.offScreenTarget.width,
+                    outputHeight: simulation.offScreenTarget.height
+                });
+            }
+            gui.add = function(...args) {
+                if (args[1] === 'simulationQuality') {
+                    installFluidViscosity(args[0]);
+                    const qualityEnum = args[0].simulationQuality.__enum__;
+                    qualityEnum.SuperResolution = ['SuperResolution', 5];
+                    qualityEnum.SuperResolution.__enum__ = qualityEnum;
+                    qualityEnum.SuperResolution.toString = qualityEnum.UltraHigh.toString;
+                    args[2] = [qualityEnum.SuperResolution, ...args[2]];
+                    const simulation = args[0];
+                    const viewport = simulation.windows[0];
+                    const originalResize = viewport.handleDOMResize;
+                    simulation.wallpaperPixelScale = 1;
+                    simulation.wallpaperQuality = simulation.simulationQuality;
+                    viewport.handleDOMResize = function() {
+                        if (!this.fullscreen && !(this.setWidth === 0 && this.setHeight === 0)) {
+                            originalResize.call(this);
+                            return;
+                        }
+                        this.width = Math.round(this.element.clientWidth * simulation.wallpaperPixelScale);
+                        this.height = Math.round(this.element.clientHeight * simulation.wallpaperPixelScale);
+                        this.canvas.style.width = this.element.clientWidth + 'px';
+                        this.canvas.style.height = this.element.clientHeight + 'px';
+                        if (this.canvas.width !== this.width) this.canvas.width = this.width;
+                        if (this.canvas.height !== this.height) this.canvas.height = this.height;
+                    };
+                    window.addEventListener('resize', () => {
+                        simulation.updateSimulationTextures();
+                        simulation.updateLastMouse();
+                        reportSettings(simulation);
+                    });
+                }
+                const controller = originalAdd.apply(this, args);
+                if (controller.property === 'simulationQuality') {
+                    originalAdd.call(gui, controller.object, 'wallpaperViscosity', 0, 100)
+                        .step(1).name('Viscosity').onChange(() => reportSettings(controller.object));
+                    const qualityEnum = controller.initialValue.__enum__;
+                    const originalOnChange = controller.onChange;
+                    controller.onChange = function() {
+                        return originalOnChange.call(this, value => {
+                            const quality = qualityEnum[String(value)];
+                            if (!quality) throw new Error('Unknown quality: ' + value);
+                            const simulation = controller.object;
+                            const viewport = simulation.windows[0];
+                            const pixelScale = String(value) === 'SuperResolution' ? 2 : 1;
+                            const gl = simulation.gl;
+                            const maxViewport = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+                            const maxTexture = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+                            if (viewport.element.clientWidth * pixelScale > Math.min(maxTexture, maxViewport[0]) ||
+                                viewport.element.clientHeight * pixelScale > Math.min(maxTexture, maxViewport[1])) {
+                                simulation.simulationQuality = simulation.wallpaperQuality;
+                                controller.updateDisplay();
+                                reportSettings(simulation);
+                                throw new Error('SuperResolution exceeds the GPU texture or viewport limit');
+                            }
+                            simulation.performanceMonitor.fpsTooLowCallback = null;
+                            simulation.set_simulationQuality(pixelScale === 2 ? qualityEnum.UltraHigh : quality);
+                            simulation.simulationQuality = quality;
+                            simulation.wallpaperQuality = quality;
+                            simulation.wallpaperPixelScale = pixelScale;
+                            viewport.handleDOMResize();
+                            simulation.updateSimulationTextures();
+                            simulation.updateLastMouse();
+                            reportSettings(simulation);
+                        });
+                    };
+                } else if (controller.property === 'fluidIterations') {
+                    const originalOnChange = controller.onChange;
+                    controller.onChange = function(callback) {
+                        return originalOnChange.call(this, value => {
+                            callback(value);
+                            reportSettings(controller.object);
+                        });
+                    };
+                }
+                return controller;
+            };
+            window.fluidWallpaperSetting = function(property, value) {
+                const controller = gui.__controllers.find(item => item.property === property);
+                if (!controller) throw new Error('Unknown setting: ' + property);
+                controller.setValue(value);
+            };
+            window.fluidWallpaperCommand = function(name) {
+                const controller = gui.__controllers.find(item => item.__name === name);
+                if (!controller) throw new Error('Unknown command: ' + name);
+                controller.object[controller.property]();
+            };
+            return gui;
+        };
+        Object.assign(dat.GUI, OriginalGUI);
+        dat.GUI.prototype = OriginalGUI.prototype;
+    </script>
+</head>
+<body>
+    <div id="content"></div>
+    <script>lime.embed('content', 0, 0, '000000');</script>
+</body>
+</html>
